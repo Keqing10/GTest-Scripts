@@ -15,6 +15,8 @@
 - `utils/terminal_output.py`：终端彩色输出与单行刷新逻辑（ANSI 开启、颜色包装、行清理、宽度裁剪）。
 - `utils/path_utils.py`：路径解析工具（脚本目录相对路径、output 目录相对路径）。
 - `utils/progress.py`：进度条字符串渲染。
+- `utils/gtest_parser.py`：集中管理 gtest 输出解析规则（list、状态行、summary 段）。
+- `utils/case_report.py`：统一导出 `case_name/debug/release` 三列 CSV 格式。
 
 ## run_tests.py 使用方法
 
@@ -64,7 +66,7 @@ python partial_tests.py --no-progress
 
 输出目录默认包含：
 
-- `list.log`
+- `list.log`（默认基于 debug 可执行生成；若 debug exe 不存在，则回退到 release）
 - `case_results.csv`
 - `list-skipped.csv`
 - `list-failed.csv`
