@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import csv
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+from utils.case_report import write_case_presence_csv
+from utils.gtest_parser import extract_named_cases_by_status
+from utils.gtest_parser import parse_summary_from_log_text
 
 
 """解析 gtest 日志并生成 summary.csv。
@@ -28,21 +31,7 @@ DEFAULT_OUTPUT_DIR = Path("output")
 # DEFAULT_MODE_CSV: 模式配置文件，决定汇总哪些日志以及它们在表格中的顺序。
 DEFAULT_MODE_CSV = Path("mode.csv")
 
-# ===== 内部常量：日志解析规则，不建议修改 =====
-# SUMMARY_MARKER: 只从 gtest 收尾汇总段开始解析，避免误读前面的 case 级输出。
-SUMMARY_MARKER = "[----------] Global test environment tear-down"
-# TOTAL_RE: 提取 tests ran 和总耗时。
-TOTAL_RE = re.compile(r"\[==========\]\s+(\d+)\s+tests?\s+from\s+.*ran\.\s+\((\d+)\s+ms\s+total\)")
-# PASSED_RE: 提取通过数。
-PASSED_RE = re.compile(r"\[\s+PASSED\s+\]\s+(\d+)\s+tests?")
-# FAILED_RE: 提取失败数。
-FAILED_RE = re.compile(r"\[\s+FAILED\s+\]\s+(\d+)\s+tests?")
-# SKIPPED_RE: 提取跳过数。
-SKIPPED_RE = re.compile(r"\[\s+SKIPPED\s+\]\s+(\d+)\s+tests?")
-# CASE_STATUS_RE: 提取执行过程中单个 FAILED/SKIPPED 测例结果行，只匹配带耗时的真实用例行。
-CASE_STATUS_RE = re.compile(r"^\[\s+(FAILED|SKIPPED)\s+\]\s+(.+?)\s+\((\d+)\s+ms\)\s*$")
-
-
+# ===== 内部常量：输出文件名，不建议修改 =====
 LIST_SKIPPED_FILE = "list-skipped.csv"
 LIST_FAILED_FILE = "list-failed.csv"
 
@@ -113,54 +102,11 @@ def load_test_types(mode_csv: Path) -> list[str]:
 def parse_gtest_log(file_path: Path) -> dict[str, int | float | str]:
     """从单个日志文件中提取 total/passed/failed/skipped/time。"""
 
-    result: dict[str, int | float | str] = {
-        "Total": "-",
-        "Passed": "-",
-        "Failed": "-",
-        "Skipped": "-",
-        "TimeMin": "-",
-        "TimeMs": "-",
-    }
-
     if not file_path.exists():
-        return result
+        return parse_summary_from_log_text("")
 
     content = file_path.read_text(encoding="utf-8", errors="replace")
-    if not content:
-        return result
-
-    marker_index = content.rfind(SUMMARY_MARKER)
-    if marker_index < 0:
-        return result
-
-    tail = content[marker_index:]
-
-    total_match = TOTAL_RE.search(tail)
-    if total_match:
-        total = int(total_match.group(1))
-        time_ms = int(total_match.group(2))
-        result["Total"] = total
-        result["TimeMs"] = time_ms
-        result["TimeMin"] = round(time_ms / 60000.0, 2)
-
-    passed_match = PASSED_RE.search(tail)
-    if passed_match:
-        result["Passed"] = int(passed_match.group(1))
-
-    skipped_match = SKIPPED_RE.search(tail)
-    if skipped_match:
-        result["Skipped"] = int(skipped_match.group(1))
-
-    failed_match = FAILED_RE.search(tail)
-    if failed_match:
-        result["Failed"] = int(failed_match.group(1))
-
-    if result["Total"] != "-" and result["Skipped"] == "-":
-        result["Skipped"] = 0
-    if result["Total"] != "-" and result["Failed"] == "-":
-        result["Failed"] = 0
-
-    return result
+    return parse_summary_from_log_text(content)
 
 
 def parse_named_cases(file_path: Path, status_name: str) -> set[str]:
@@ -173,23 +119,8 @@ def parse_named_cases(file_path: Path, status_name: str) -> set[str]:
     if not file_path.exists():
         return set()
 
-    results: set[str] = set()
-    for line in file_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        match = CASE_STATUS_RE.match(line)
-        if not match:
-            continue
-
-        current_status, payload, _elapsed_ms = match.groups()
-        if current_status != status_name:
-            continue
-
-        payload = payload.strip()
-        if not payload:
-            continue
-
-        results.add(payload)
-
-    return results
+    content = file_path.read_text(encoding="utf-8", errors="replace")
+    return extract_named_cases_by_status(content, status_name)
 
 
 def compare_count_status(debug: dict[str, int | float | str], release: dict[str, int | float | str]) -> str:
@@ -364,13 +295,7 @@ def write_case_list(output_dir: Path, file_name: str, cases: dict[str, tuple[boo
     """导出 FAILED/SKIPPED 用例清单 CSV，三列分别是用例名、debug、release。"""
 
     file_path = output_dir / file_name
-    with file_path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["case_name", "debug", "release"])
-        for case_name in sorted(cases):
-            debug_flag, release_flag = cases[case_name]
-            writer.writerow([case_name, "Y" if debug_flag else "N", "Y" if release_flag else "N"])
-    return file_path
+    return write_case_presence_csv(file_path, cases)
 
 
 # ===== 对外入口 =====

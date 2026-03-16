@@ -2,10 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import ctypes
-import os
-import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -14,6 +10,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import summary
+from utils.gtest_parser import count_gtest_list_cases
+from utils.gtest_parser import is_complete_case_line
+from utils.path_utils import resolve_path_from
+from utils.progress import render_progress_bar
+from utils.progress import SPINNER_FRAMES
+from utils.process_job import JobObject
+from utils.terminal_output import ANSI_CYAN
+from utils.terminal_output import ANSI_GREEN
+from utils.terminal_output import ANSI_RED
+from utils.terminal_output import ANSI_YELLOW
+from utils.terminal_output import clear_current_line
+from utils.terminal_output import color_text
+from utils.terminal_output import fit_status_to_terminal
+from utils.terminal_output import try_enable_ansi_colors
 
 
 """并发执行 gtest 任务，并在结束后生成汇总。
@@ -52,132 +62,12 @@ DEFAULT_ENABLE_CASE_PROGRESS = True
 DEFAULT_RUN_SUMMARY = True
 
 # ===== 内部常量：下面这些是脚本实现细节，不建议修改 =====
-# COMPLETE_CASE_RE: 匹配 gtest 单个 case 完成时的输出行，用于累计实时进度。
-COMPLETE_CASE_RE = re.compile(r"^\[\s*(OK|FAILED|SKIPPED)\s*\]")
-# LIST_CASE_RE: 匹配 --gtest_list_tests 输出中的真实测试条目。
-LIST_CASE_RE = re.compile(r"^\s{2}\S")
-# LIST_COMMENT_RE: 排除 --gtest_list_tests 输出中的注释行。
-LIST_COMMENT_RE = re.compile(r"^\s{2}#")
-# SPINNER_FRAMES: 进度行前面的转轮动画字符。
-SPINNER_FRAMES = ("|", "/", "-", "\\")
+# SPINNER_FRAMES: 进度行前面的转轮动画字符（来自公共进度模块）。
 # PROGRESS_BAR_WIDTH: 任务/用例进度条的固定宽度，调大更细致，调小更紧凑。
 PROGRESS_BAR_WIDTH = 18
 # ACTIVE_NAME_WIDTH: 终端里 active 名称的最大显示宽度，避免名称过长导致进度行抖动。
 ACTIVE_NAME_WIDTH = 32
-# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Job Object 关闭时自动杀掉所有子进程的 Win32 标志位。
-JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-# JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: SetInformationJobObject 使用的结构类型编号。
-JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-# STD_OUTPUT_HANDLE: Windows 标准输出句柄编号，用来开启终端 ANSI 颜色。
-STD_OUTPUT_HANDLE = -11
-# ENABLE_VIRTUAL_TERMINAL_PROCESSING: 允许 Windows 控制台识别 ANSI 转义序列。
-ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-# ANSI_RESET: 重置终端颜色。
-ANSI_RESET = "\033[0m"
-# ANSI_GREEN: 成功事件颜色。
-ANSI_GREEN = "\033[32m"
-# ANSI_RED: 失败事件颜色。
-ANSI_RED = "\033[31m"
-# ANSI_YELLOW: 警告/清理事件颜色。
-ANSI_YELLOW = "\033[33m"
-# ANSI_CYAN: 普通信息颜色。
-ANSI_CYAN = "\033[36m"
-# ANSI_CLEAR_LINE: 清空当前终端整行，确保 DONE/FAIL 可以覆盖掉上一帧进度条。
-ANSI_CLEAR_LINE = "\033[2K"
-
-
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-
-# ===== Win32 Job Object / 控制台颜色封装 =====
-class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_longlong),
-        ("PerJobUserTimeLimit", ctypes.c_longlong),
-        ("LimitFlags", ctypes.c_uint32),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", ctypes.c_uint32),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", ctypes.c_uint32),
-        ("SchedulingClass", ctypes.c_uint32),
-    ]
-
-
-class IO_COUNTERS(ctypes.Structure):
-    _fields_ = [
-        ("ReadOperationCount", ctypes.c_uint64),
-        ("WriteOperationCount", ctypes.c_uint64),
-        ("OtherOperationCount", ctypes.c_uint64),
-        ("ReadTransferCount", ctypes.c_uint64),
-        ("WriteTransferCount", ctypes.c_uint64),
-        ("OtherTransferCount", ctypes.c_uint64),
-    ]
-
-
-class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
-        ("IoInfo", IO_COUNTERS),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
-
-kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-kernel32.SetInformationJobObject.restype = ctypes.c_int
-kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-kernel32.AssignProcessToJobObject.restype = ctypes.c_int
-kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-kernel32.CloseHandle.restype = ctypes.c_int
-kernel32.GetStdHandle.argtypes = [ctypes.c_int]
-kernel32.GetStdHandle.restype = ctypes.c_void_p
-kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-kernel32.GetConsoleMode.restype = ctypes.c_int
-kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-kernel32.SetConsoleMode.restype = ctypes.c_int
-
-
-class JobObject:
-    """Windows Job Object 封装，用于在脚本退出时统一杀掉全部子进程。"""
-
-    def __init__(self) -> None:
-        self._handle = kernel32.CreateJobObjectW(None, None)
-        if not self._handle:
-            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
-
-        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        ok = kernel32.SetInformationJobObject(
-            self._handle,
-            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-        )
-        if not ok:
-            error = ctypes.get_last_error()
-            self.close()
-            raise OSError(error, "SetInformationJobObject failed")
-
-    def add_process(self, process_handle: int) -> None:
-        ok = kernel32.AssignProcessToJobObject(self._handle, ctypes.c_void_p(process_handle))
-        if not ok:
-            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
-
-    def close(self) -> None:
-        if self._handle:
-            kernel32.CloseHandle(self._handle)
-            self._handle = None
-
-    def __enter__(self) -> "JobObject":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
+# ANSI_*: 终端颜色常量来自公共终端模块。
 
 
 @dataclass(slots=True)
@@ -240,10 +130,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def resolve_path(path_text: str) -> Path:
     # 所有相对路径都基于脚本目录解析，避免受当前终端 cwd 影响。
-    path = Path(path_text)
-    if path.is_absolute():
-        return path
-    return (SCRIPT_DIR / path).resolve()
+    return resolve_path_from(SCRIPT_DIR, path_text)
 
 
 def build_configs(args: argparse.Namespace, color_enabled: bool) -> list[tuple[str, Path]]:
@@ -314,11 +201,7 @@ def get_gtest_case_count(exe: Path, filter_name: str) -> int:
     if not completed.stdout:
         return -1
 
-    return sum(
-        1
-        for line in completed.stdout.splitlines()
-        if LIST_CASE_RE.match(line) and not LIST_COMMENT_RE.match(line)
-    )
+    return count_gtest_list_cases(completed.stdout)
 
 
 def stream_output(stream, target_file: Path, task: Task | None, count_cases: bool) -> None:
@@ -326,7 +209,7 @@ def stream_output(stream, target_file: Path, task: Task | None, count_cases: boo
     with target_file.open("w", encoding="utf-8", errors="replace", newline="", buffering=1) as handle:
         for line in iter(stream.readline, ""):
             handle.write(line)
-            if count_cases and task and COMPLETE_CASE_RE.match(line):
+            if count_cases and task and is_complete_case_line(line):
                 task.increment_case_done()
     stream.close()
 
@@ -363,69 +246,6 @@ def remove_empty_error_logs(output_dir: Path) -> None:
             err_log.unlink(missing_ok=True)
 
 
-def try_enable_ansi_colors() -> bool:
-    """在 Windows 终端启用 ANSI 颜色；失败时退回纯文本。"""
-
-    if os.name != "nt" or not sys.stdout.isatty():
-        return False
-
-    handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-    if not handle:
-        return False
-
-    mode = ctypes.c_uint32()
-    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-        return False
-
-    if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
-        return True
-
-    return bool(kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-
-
-def color_text(text: str, color: str | None, enabled: bool) -> str:
-    if not enabled or not color:
-        return text
-    return f"{color}{text}{ANSI_RESET}"
-
-
-def clear_current_line(interactive: bool, previous_length: int, color_enabled: bool) -> None:
-    if not interactive or previous_length <= 0:
-        return
-
-    if color_enabled:
-        sys.stdout.write("\r" + ANSI_CLEAR_LINE)
-    else:
-        sys.stdout.write("\r" + (" " * previous_length) + "\r")
-    sys.stdout.flush()
-
-
-def get_terminal_width(default: int = 120) -> int:
-    """获取当前终端宽度，用于避免进度行过长后自动换行。"""
-
-    try:
-        return max(40, shutil.get_terminal_size(fallback=(default, 20)).columns)
-    except OSError:
-        return default
-
-
-def fit_status_to_terminal(status: str, interactive: bool) -> str:
-    """将进度行裁剪到终端宽度内，避免 \r 覆盖时因为换行失效。"""
-
-    if not interactive:
-        return status
-
-    width = get_terminal_width()
-    max_length = max(10, width - 1)
-    if len(status) <= max_length:
-        return status
-
-    if max_length <= 3:
-        return status[:max_length]
-
-    return status[: max_length - 3] + "..."
-
-
 def format_elapsed(start_time: float) -> str:
     elapsed = max(0, int(time.time() - start_time))
     hours, remainder = divmod(elapsed, 3600)
@@ -447,13 +267,6 @@ def shorten_text(text: str, width: int) -> str:
     return text[: width - 3] + "..."
 
 
-def render_progress_bar(done: int, total: int, width: int = PROGRESS_BAR_WIDTH) -> str:
-    if total <= 0:
-        return "-" * width
-    filled = min(width, int((done / total) * width))
-    return "#" * filled + "-" * (width - filled)
-
-
 def build_status_line(
     completed: int,
     total: int,
@@ -464,11 +277,11 @@ def build_status_line(
     start_time: float,
     spinner: str,
 ) -> str:
-    task_bar = render_progress_bar(completed, total)
+    task_bar = render_progress_bar(completed, total, PROGRESS_BAR_WIDTH)
     status = f"{spinner} task[{task_bar}] {completed}/{total} | run={len(running_names)} | t={format_elapsed(start_time)}"
 
     if known_case_total > 0:
-        case_bar = render_progress_bar(completed_cases, known_case_total)
+        case_bar = render_progress_bar(completed_cases, known_case_total, PROGRESS_BAR_WIDTH)
         status += f" | case[{case_bar}] {completed_cases}/{known_case_total}"
         if unknown_case_tasks:
             status += f" +{unknown_case_tasks}?"
@@ -480,11 +293,11 @@ def build_status_line(
     return status
 
 
-def print_status_line(status: str, interactive: bool, previous_length: int) -> int:
+def print_status_line(status: str, interactive: bool, previous_length: int, color_enabled: bool) -> int:
     # 进度行只占用当前一行，下一次刷新时直接覆盖。
     if interactive:
         fitted_status = fit_status_to_terminal(status, interactive)
-        clear_current_line(interactive, previous_length, color_enabled=True)
+        clear_current_line(interactive, previous_length, color_enabled)
         sys.stdout.write("\r" + fitted_status)
         sys.stdout.flush()
         return len(fitted_status)
@@ -493,9 +306,9 @@ def print_status_line(status: str, interactive: bool, previous_length: int) -> i
     return len(status)
 
 
-def finalize_status_line(interactive: bool, previous_length: int) -> None:
+def finalize_status_line(interactive: bool, previous_length: int, color_enabled: bool) -> None:
     if interactive and previous_length:
-        clear_current_line(interactive, previous_length, color_enabled=False)
+        clear_current_line(interactive, previous_length, color_enabled)
 
 
 def print_event_line(message: str, interactive: bool, previous_length: int, color: str | None, color_enabled: bool) -> int:
@@ -678,7 +491,7 @@ def run(argv: list[str] | None = None) -> int:
                     spinner=spinner,
                 )
 
-                status_length = print_status_line(status, interactive, status_length)
+                status_length = print_status_line(status, interactive, status_length, color_enabled)
 
                 if completed == len(tasks):
                     break
@@ -695,7 +508,7 @@ def run(argv: list[str] | None = None) -> int:
             color_enabled,
         )
     finally:
-        finalize_status_line(interactive, status_length)
+        finalize_status_line(interactive, status_length, color_enabled)
         for task in tasks:
             finalize_task_outputs(task)
         remove_empty_error_logs(output_dir)

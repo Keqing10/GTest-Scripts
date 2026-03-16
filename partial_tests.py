@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import re
 import subprocess
 import sys
 import threading
@@ -10,6 +9,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+
+from utils.case_report import write_case_presence_csv
+from utils.path_utils import resolve_path_from
+from utils.path_utils import resolve_under_output
+from utils.gtest_parser import infer_single_case_status
+from utils.gtest_parser import parse_gtest_list_output
+from utils.progress import render_progress_bar
+from utils.progress import SPINNER_FRAMES
+from utils.process_job import JobObject
 
 
 """独立脚本：按“每次一个用例”的方式并行运行 gtest。
@@ -29,7 +37,7 @@ from pathlib import Path
 # SCRIPT_DIR: 当前脚本所在目录。相对路径都会以它为基准解析，通常不需要修改。
 SCRIPT_DIR = Path(__file__).resolve().parent
 # DEFAULT_OUTPUT_DIR: 默认输出目录，存放 list.log 和结果 CSV。
-DEFAULT_OUTPUT_DIR = Path("output-part")
+DEFAULT_OUTPUT_DIR = Path("output-partial")
 # DEFAULT_RESULT_CSV: 默认结果 CSV 文件名，包含每个用例的 debug/release 结果。
 DEFAULT_RESULT_CSV = "case_results.csv"
 # DEFAULT_LIST_LOG: 默认测例列表文件名，保存列出的全部测例名。
@@ -55,16 +63,6 @@ DEFAULT_PROGRESS_BAR_WIDTH = 20
 DEFAULT_DEBUG_EXE = Path(r"Debug/tests.exe")
 # DEFAULT_RELEASE_EXE: Release 版 tests.exe 默认路径。支持绝对路径或相对路径。
 DEFAULT_RELEASE_EXE = Path(r"Release/tests.exe")
-
-
-# ===== 内部常量：gtest 列表解析规则，不建议修改 =====
-SUITE_RE = re.compile(r"^(\S+)\.$")
-CASE_RE = re.compile(r"^\s{2}(\S.*)$")
-COMMENT_RE = re.compile(r"^\s{2}#")
-SPINNER_FRAMES = ("|", "/", "-", "\\")
-FAILED_CASE_RE = re.compile(r"^\[\s+FAILED\s+\]\s+")
-SKIPPED_CASE_RE = re.compile(r"^\[\s+SKIPPED\s+\]\s+")
-PASSED_CASE_RE = re.compile(r"^\[\s+OK\s+\]\s+")
 
 
 @dataclass(slots=True)
@@ -102,18 +100,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def resolve_path(path_text: str) -> Path:
     # 相对路径统一按脚本目录解析，避免受当前终端 cwd 影响。
-    path = Path(path_text)
-    if path.is_absolute():
-        return path
-    return (SCRIPT_DIR / path).resolve()
-
-
-def resolve_under_output(path_text: str, output_dir: Path) -> Path:
-    # 结果文件未给绝对路径时，固定落在 output_dir 下。
-    path = Path(path_text)
-    if path.is_absolute():
-        return path
-    return output_dir / path
+    return resolve_path_from(SCRIPT_DIR, path_text)
 
 
 # ===== gtest 测例枚举与执行 =====
@@ -130,34 +117,7 @@ def list_cases(exe_path: Path) -> list[str]:
     if completed.returncode != 0:
         raise RuntimeError(f"列出测例失败: {exe_path}\n{completed.stdout}\n{completed.stderr}")
 
-    suite_name = ""
-    cases: list[str] = []
-    for line in completed.stdout.splitlines():
-        if not line.strip():
-            continue
-
-        suite_match = SUITE_RE.match(line.strip())
-        if suite_match:
-            suite_name = suite_match.group(1)
-            continue
-
-        if COMMENT_RE.match(line):
-            continue
-
-        case_match = CASE_RE.match(line)
-        if case_match and suite_name:
-            case_leaf = case_match.group(1).split("#", 1)[0].strip()
-            if case_leaf:
-                cases.append(f"{suite_name}.{case_leaf}")
-
-    # 去重保序
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for name in cases:
-        if name not in seen:
-            seen.add(name)
-            ordered.append(name)
-    return ordered
+    return parse_gtest_list_output(completed.stdout)
 
 
 def write_case_list_log(list_log: Path, cases: list[str]) -> None:
@@ -167,34 +127,27 @@ def write_case_list_log(list_log: Path, cases: list[str]) -> None:
             handle.write("\n")
 
 
-def run_one_case(exe_path: Path, case_name: str) -> str:
+def run_one_case(exe_path: Path, case_name: str, job: JobObject) -> str:
     # 每个子进程只跑 1 个用例，满足“单测粒度并行”。
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [str(exe_path), f"--gtest_filter={case_name}"],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
+        cwd=str(SCRIPT_DIR),
     )
+    job.add_process(process._handle)
+    stdout_text, stderr_text = process.communicate()
 
-    # 单用例模式下优先以用例状态行判定，避免把 SKIPPED 误归类为 FAIL。
-    output_text = (completed.stdout or "") + "\n" + (completed.stderr or "")
-    if FAILED_CASE_RE.search(output_text):
-        return "FAIL"
-    if SKIPPED_CASE_RE.search(output_text):
-        return "SKIPPED"
-    if PASSED_CASE_RE.search(output_text):
-        return "PASS"
+    # 单用例模式下优先以状态行判定，避免把 SKIPPED 误归类为 PASS。
+    output_text = (stdout_text or "") + "\n" + (stderr_text or "")
+    status = infer_single_case_status(output_text)
+    if status != "UNKNOWN":
+        return status
 
-    return "PASS" if completed.returncode == 0 else "FAIL"
-
-
-def render_progress_bar(done: int, total: int, width: int = DEFAULT_PROGRESS_BAR_WIDTH) -> str:
-    if total <= 0:
-        return "-" * width
-    filled = min(width, int((done / total) * width))
-    return "#" * filled + "-" * (width - filled)
+    return "PASS" if process.returncode == 0 else "FAIL"
 
 
 def format_elapsed(start_time: float) -> str:
@@ -221,6 +174,7 @@ def run_cases_parallel(
     workers: int,
     label: str,
     show_progress: bool,
+    job: JobObject,
 ) -> dict[str, str]:
     """并行执行用例，返回 {case_name: PASS/FAIL/SKIPPED}。"""
     if not cases:
@@ -245,7 +199,7 @@ def run_cases_parallel(
         with lock:
             running += 1
         try:
-            return case_name, run_one_case(exe_path, case_name)
+            return case_name, run_one_case(exe_path, case_name, job)
         finally:
             with lock:
                 running -= 1
@@ -263,7 +217,7 @@ def run_cases_parallel(
 
             spinner = SPINNER_FRAMES[frame_index % len(SPINNER_FRAMES)]
             frame_index += 1
-            bar = render_progress_bar(done_snapshot, total)
+            bar = render_progress_bar(done_snapshot, total, DEFAULT_PROGRESS_BAR_WIDTH)
             status = (
                 f"[{label}] {spinner} [{bar}] {done_snapshot}/{total} "
                 f"run={running_snapshot} pass={pass_snapshot} fail={fail_snapshot} skip={skipped_snapshot} "
@@ -278,7 +232,7 @@ def run_cases_parallel(
             pass_snapshot = passed_count
             fail_snapshot = failed_count
             skipped_snapshot = skipped_count
-        final_bar = render_progress_bar(done_snapshot, total)
+        final_bar = render_progress_bar(done_snapshot, total, DEFAULT_PROGRESS_BAR_WIDTH)
         final_line = (
             f"[{label}] done [{final_bar}] {done_snapshot}/{total} "
             f"pass={pass_snapshot} fail={fail_snapshot} skip={skipped_snapshot} t={format_elapsed(start_time)}"
@@ -292,7 +246,9 @@ def run_cases_parallel(
         progress_thread = threading.Thread(target=progress_loop, name=f"progress-{label}", daemon=True)
         progress_thread.start()
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=workers)
+    shutdown_wait = True
+    try:
         future_map = {executor.submit(task, case_name): case_name for case_name in cases}
         for future in as_completed(future_map):
             case_name, status = future.result()
@@ -305,16 +261,23 @@ def run_cases_parallel(
                 else:
                     failed_count += 1
             results[case_name] = status
+    except KeyboardInterrupt:
+        shutdown_wait = False
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if shutdown_wait:
+            executor.shutdown(wait=True, cancel_futures=True)
 
-    if progress_enabled:
-        stop_event.set()
-        if progress_thread is not None:
-            progress_thread.join(timeout=2)
-    else:
-        print(
-            f"[{label}] done {total}/{total} pass={passed_count} fail={failed_count} "
-            f"skip={skipped_count} t={format_elapsed(start_time)}"
-        )
+        if progress_enabled:
+            stop_event.set()
+            if progress_thread is not None:
+                progress_thread.join(timeout=2)
+        else:
+            print(
+                f"[{label}] done {total}/{total} pass={passed_count} fail={failed_count} "
+                f"skip={skipped_count} t={format_elapsed(start_time)}"
+            )
 
     return results
 
@@ -405,16 +368,6 @@ def collect_case_flags(rows: list[CaseResult], status_name: str) -> dict[str, tu
     return cases
 
 
-def write_case_list(csv_path: Path, cases: dict[str, tuple[bool, bool]]) -> None:
-    # 与 summary.py 导出风格一致：case_name/debug/release 三列，Y/N 标记。
-    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["case_name", "debug", "release"])
-        for case_name in sorted(cases):
-            debug_flag, release_flag = cases[case_name]
-            writer.writerow([case_name, "Y" if debug_flag else "N", "Y" if release_flag else "N"])
-
-
 # ===== 运行前检查与主流程 =====
 def pick_case_list_exe(run_mode: str, debug_exe: Path, release_exe: Path) -> Path:
     # 优先使用将要执行的模式对应 exe；both 模式优先 debug。
@@ -470,17 +423,27 @@ def main(argv: list[str] | None = None) -> int:
     debug_updates: dict[str, str] | None = None
     release_updates: dict[str, str] | None = None
 
-    if args.run_mode in {"both", "debug"}:
-        debug_updates = run_cases_parallel(debug_exe, target_cases, args.workers, "debug", show_progress)
-    if args.run_mode in {"both", "release"}:
-        release_updates = run_cases_parallel(release_exe, target_cases, args.workers, "release", show_progress)
+    interrupted = False
+
+    try:
+        with JobObject() as job:
+            if args.run_mode in {"both", "debug"}:
+                debug_updates = run_cases_parallel(debug_exe, target_cases, args.workers, "debug", show_progress, job)
+            if args.run_mode in {"both", "release"}:
+                release_updates = run_cases_parallel(release_exe, target_cases, args.workers, "release", show_progress, job)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("[CLEANUP] Terminating all child processes...")
+
+    if interrupted:
+        return 130
 
     merged_rows = merge_results(all_cases, existing, debug_updates, release_updates)
     write_result_csv(result_csv, merged_rows)
     skipped_cases = collect_case_flags(merged_rows, "SKIPPED")
     failed_cases = collect_case_flags(merged_rows, "FAIL")
-    write_case_list(list_skipped_csv, skipped_cases)
-    write_case_list(list_failed_csv, failed_cases)
+    write_case_presence_csv(list_skipped_csv, skipped_cases)
+    write_case_presence_csv(list_failed_csv, failed_cases)
     print(f"[INFO] 已更新结果 CSV: {result_csv}")
     print(f"[INFO] 已输出跳过清单: {list_skipped_csv}")
     print(f"[INFO] 已输出失败清单: {list_failed_csv}")
