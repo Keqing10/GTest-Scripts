@@ -21,8 +21,8 @@ NAMED_CASE_STATUS_RE = re.compile(r"^\[\s+(FAILED|SKIPPED)\s+\]\s+(.+?)\s+\((\d+
 # 单单个 case 启动标志
 RUN_CASE_RE = re.compile(r"^\[\s*RUN\s*\]\s+(.+?)\s*$")
 
-# 提取每一行明确的结果（包括 PASSED/OK, FAILED, SKIPPED）及测例名
-COMPLETE_CASE_RESULT_RE = re.compile(r"^\[\s*(OK|PASSED|FAILED|SKIPPED)\s*\]\s+(.+?)(?:\s+\(\d+\s+ms\))?\s*$")
+# 提取每一行明确的结果（包括 PASSED/OK, FAILED, SKIPPED）及测例名/耗时
+COMPLETE_CASE_RESULT_RE = re.compile(r"^\[\s*(OK|PASSED|FAILED|SKIPPED)\s*\]\s+(.+?)(?:\s+\((\d+)\s+ms\))?\s*$")
 
 # 汇总段解析规则。
 SUMMARY_MARKER = "[----------] Global test environment tear-down"
@@ -92,11 +92,12 @@ def is_complete_case_line(line: str) -> bool:
     return bool(COMPLETE_CASE_LINE_RE.match(line))
 
 
-def parse_batch_case_statuses(log_text: str) -> tuple[set[str], dict[str, str]]:
-    """批量从一次执行的完整输出中解析各个用例的结果。返回 (已开始的用例集合, 已完成的用例及其结果字典)。"""
+def parse_batch_case_statuses(log_text: str) -> tuple[set[str], dict[str, str], dict[str, int]]:
+    """批量解析一次执行输出，返回 (已开始集合, 已完成状态, 已完成耗时ms)。"""
     
     started_cases = set()
-    parsed_results = {}
+    parsed_results: dict[str, str] = {}
+    elapsed_ms: dict[str, int] = {}
     for line in log_text.splitlines():
         run_match = RUN_CASE_RE.match(line)
         if run_match:
@@ -105,7 +106,7 @@ def parse_batch_case_statuses(log_text: str) -> tuple[set[str], dict[str, str]]:
 
         match = COMPLETE_CASE_RESULT_RE.match(line)
         if match:
-            status, case_name = match.groups()
+            status, case_name, elapsed = match.groups()
             case_name = case_name.strip()
             if status in ("OK", "PASSED"):
                 parsed_results[case_name] = "PASS"
@@ -113,8 +114,11 @@ def parse_batch_case_statuses(log_text: str) -> tuple[set[str], dict[str, str]]:
                 parsed_results[case_name] = "FAIL"
             elif status == "SKIPPED":
                 parsed_results[case_name] = "SKIPPED"
-    
-    return started_cases, parsed_results
+
+            if elapsed is not None:
+                elapsed_ms[case_name] = int(elapsed)
+
+    return started_cases, parsed_results, elapsed_ms
 
 
 def extract_named_cases_by_status(log_text: str, status_name: str) -> set[str]:

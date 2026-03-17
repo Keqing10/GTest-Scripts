@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import subprocess
 import sys
 import threading
@@ -13,7 +14,6 @@ from pathlib import Path
 from utils.case_report import write_case_presence_csv
 from utils.path_utils import resolve_path_from
 from utils.path_utils import resolve_under_output
-from utils.gtest_parser import infer_single_case_status
 from utils.gtest_parser import parse_gtest_list_output
 from utils.gtest_parser import parse_batch_case_statuses
 from utils.progress import render_progress_bar
@@ -21,7 +21,7 @@ from utils.progress import SPINNER_FRAMES
 from utils.process_job import JobObject
 
 
-"""独立脚本：按“每次一个用例”的方式并行运行 gtest。
+"""独立脚本：按“分组批量 + 并行进程”的方式运行 gtest。
 
 核心流程：
 1. 先列出全部测例并写入 list.log；
@@ -48,10 +48,14 @@ DEFAULT_LIST_SKIPPED_CSV = "list-skipped.csv"
 # DEFAULT_LIST_FAILED_CSV: 默认失败用例清单文件名（和 run_tests 风格一致）。
 DEFAULT_LIST_FAILED_CSV = "list-failed.csv"
 # DEFAULT_WORKERS: 默认并行线程数（每个线程一次跑一批测例）。
-DEFAULT_WORKERS = 6
+DEFAULT_WORKERS = 30
 # DEFAULT_TESTS_PER_GROUP: 每批次执行的测例数目。
 # 组装数量太大可能触发命令行长度限制 (8191)。50左右较安全，能有效降低启动开销。
 DEFAULT_TESTS_PER_GROUP = 50
+# DEFAULT_GROUP_MULTIPLIER: 批次数倍率。目标批次数约为 workers * 倍率（同时受 group-size 上限约束）。
+DEFAULT_GROUP_MULTIPLIER = 8
+# DEFAULT_BATCH_START_RETRIES: 批次在首用例前崩溃时的重试次数，避免瞬时资源抖动被误判为 FAIL。
+DEFAULT_BATCH_START_RETRIES = 2
 # DEFAULT_TEST_MODE: 默认测试范围。full=全量；partial=只重测未双通过用例。
 DEFAULT_TEST_MODE = "full"  # full | partial
 # DEFAULT_RUN_MODE: 默认构建模式。both/debug/release。
@@ -62,6 +66,9 @@ DEFAULT_ENABLE_PROGRESS = True
 DEFAULT_PROGRESS_REFRESH_SEC = 1
 # DEFAULT_PROGRESS_BAR_WIDTH: 进度条宽度。
 DEFAULT_PROGRESS_BAR_WIDTH = 20
+# DEFAULT_SMOOTH_SHRINK_START_RATIO: 从总量的该比例处开始平滑缩组（0~1）。
+# 例如 0.60 表示前 40% 保持吞吐，后 60% 线性收敛到 1。
+DEFAULT_SMOOTH_SHRINK_START_RATIO = 0.60
 
 # DEFAULT_DEBUG_EXE: Debug 版 tests.exe 默认路径。支持绝对路径或相对路径。
 DEFAULT_DEBUG_EXE = Path(r"Debug/tests.exe")
@@ -79,7 +86,7 @@ class CaseResult:
 # ===== 命令行参数与路径处理 =====
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """命令行参数：控制测试范围、构建模式、并发度和输出位置。"""
-    parser = argparse.ArgumentParser(description="Run gtest one case per process in parallel.")
+    parser = argparse.ArgumentParser(description="Run gtest in adaptive grouped batches with parallel workers.")
     parser.add_argument(
         "--mode",
         choices=("full", "partial"),
@@ -99,6 +106,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--list-log", default=DEFAULT_LIST_LOG, help="测例清单文件名或路径。")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="并行线程数。")
     parser.add_argument("--group-size", type=int, default=DEFAULT_TESTS_PER_GROUP, help="每个执行实例串行跑的最大用例数。")
+    parser.add_argument("--group-multiplier", type=int, default=DEFAULT_GROUP_MULTIPLIER, help="批次数倍率（目标批次数约为 workers*倍率）。")
     parser.add_argument("--no-progress", action="store_true", help="关闭终端进度条，改为仅输出关键日志。")
     return parser.parse_args(argv)
 
@@ -132,10 +140,74 @@ def write_case_list_log(list_log: Path, cases: list[str]) -> None:
             handle.write("\n")
 
 
+def interleave_cases_by_suite(cases: list[str]) -> list[str]:
+    """按 Suite 交织打散用例，减少同类慢测例在尾部扎堆。"""
+
+    suite_buckets: dict[str, list[str]] = {}
+    for case_name in cases:
+        suite_name, _sep, _leaf = case_name.partition(".")
+        if suite_name not in suite_buckets:
+            suite_buckets[suite_name] = []
+        suite_buckets[suite_name].append(case_name)
+
+    if len(suite_buckets) <= 1:
+        return list(cases)
+
+    # 先取大 bucket，可更快把大 suite 打散到全局。
+    suite_order = sorted(suite_buckets.keys(), key=lambda name: len(suite_buckets[name]), reverse=True)
+    interleaved: list[str] = []
+    active = True
+    while active:
+        active = False
+        for suite_name in suite_order:
+            bucket = suite_buckets[suite_name]
+            if not bucket:
+                continue
+            interleaved.append(bucket.pop(0))
+            active = True
+
+    return interleaved
+
+
+def build_case_batches(
+    cases: list[str],
+    workers: int,
+    max_group_size: int,
+    group_multiplier: int,
+) -> tuple[list[list[str]], int, str]:
+    """构建自适应分组。
+
+    策略：
+    - `max_group_size` 仅作为上限；
+    - 批次数会适度多于 worker，增强后半程补位能力；
+    - 用 round-robin 分配，尽量打散潜在慢测例，缓解尾部拖尾。
+    """
+
+    if not cases:
+        return [], 0, "empty"
+
+    # 先按 suite 打散，再进入轮转分组，降低“慢 suite 尾部集中”概率。
+    ordered_cases = interleave_cases_by_suite(cases)
+
+    total = len(ordered_cases)
+    min_groups_for_cap = max(1, math.ceil(total / max_group_size))
+    # 保持比 worker 更多的批次，提升线程池后半程补位能力，减少尾部仅剩少量进程。
+    target_groups = max(min_groups_for_cap, min(total, max(1, workers) * max(1, group_multiplier)))
+
+    batches: list[list[str]] = [[] for _ in range(target_groups)]
+    for index, case_name in enumerate(ordered_cases):
+        batches[index % target_groups].append(case_name)
+
+    compact_batches = [b for b in batches if b]
+    adaptive_group_size = max(len(b) for b in compact_batches)
+    return compact_batches, adaptive_group_size, "count-adaptive-rr"
+
+
 def run_case_batch(exe_path: Path, cases: list[str], job: JobObject) -> dict[str, str]:
     # 按照批次顺次执行：如果遇到由于异常进程崩溃导致中断，记录崩溃用例为 FAIL，并重新拉起剩余未执行的用例。
     results: dict[str, str] = {}
     remaining = cases[:]
+    start_retry_counter: dict[str, int] = {}
 
     while remaining:
         filter_arg = ":".join(remaining)
@@ -152,7 +224,7 @@ def run_case_batch(exe_path: Path, cases: list[str], job: JobObject) -> dict[str
         stdout_text, stderr_text = process.communicate()
 
         output_text = (stdout_text or "") + "\n" + (stderr_text or "")
-        started, finished = parse_batch_case_statuses(output_text)
+        started, finished, _parsed_elapsed = parse_batch_case_statuses(output_text)
 
         crashed_index = -1
         for i, c in enumerate(remaining):
@@ -176,8 +248,16 @@ def run_case_batch(exe_path: Path, cases: list[str], job: JobObject) -> dict[str
         if crashed_index == 0 and not started:
             # 情况A：程序在跑到第一个正常的用例（非DISABLED）之前就崩溃了。
             # 这可能是该用例的 SetUp 崩溃，或者是全局起不来。
-            # 为了防止对着同一个用例疯狂重启导致死循环，把它吃掉并仅仅将其标记为FAIL。从而让后面的用例有机会继续。
-            results[remaining[0]] = "FAIL"
+            # 先短重试，避免瞬时资源抖动导致的误判 FAIL。
+            head_case = remaining[0]
+            retry_count = start_retry_counter.get(head_case, 0)
+            if retry_count < DEFAULT_BATCH_START_RETRIES:
+                start_retry_counter[head_case] = retry_count + 1
+                time.sleep(0.05 * (retry_count + 1))
+                continue
+
+            # 多次重试仍失败，再标记为 FAIL 并跳过，防止死循环。
+            results[head_case] = "FAIL"
             remaining = remaining[1:]
         elif crashed_index >= 0:
             # 发生了部分崩溃，尝试从崩溃位置继续接力
@@ -217,6 +297,7 @@ def run_cases_parallel(
     cases: list[str],
     workers: int,
     group_size: int,
+    group_multiplier: int,
     label: str,
     show_progress: bool,
     job: JobObject,
@@ -224,11 +305,11 @@ def run_cases_parallel(
     """并行执行用例（基于分组串行执行），返回 {case_name: PASS/FAIL/SKIPPED}。"""
     if not cases:
         return {}
-    
-    # 按照先后顺序分组，保留 Suite 内局部性，能重用 GTest 的 Suite-level Setup/Teardown 开销
-    grouped_cases = [cases[i:i + group_size] for i in range(0, len(cases), group_size)]
 
-    total = len(cases)
+    # 先按 suite 打散，再由 worker 在运行时按“剩余量”动态领取下一批。
+    # 这样尾部剩余测例变少时，批次会自动变小，减少最后几批拖尾。
+    ordered_cases = interleave_cases_by_suite(cases)
+    total = len(ordered_cases)
     results: dict[str, str] = {}
     lock = threading.Lock()
     done = 0
@@ -236,21 +317,77 @@ def run_cases_parallel(
     failed_count = 0
     skipped_count = 0
     running = 0
+    next_index = 0
+    claimed_batches = 0
+    smooth_shrink_start_remaining = max(1, math.ceil(total * DEFAULT_SMOOTH_SHRINK_START_RATIO))
+
+    print(
+        f"[{label}] 分组策略: dynamic-claim workers={workers} group_mult={group_multiplier} max_group={group_size} "
+        f"smooth_shrink_start={smooth_shrink_start_remaining}/{total}"
+    )
 
     interactive = show_progress and sys.stdout.isatty()
     progress_enabled = show_progress
     stop_event = threading.Event()
     start_time = time.time()
 
-    def task(batch: list[str]) -> dict[str, str]:
-        nonlocal running
+    def claim_next_batch() -> list[str]:
+        nonlocal next_index, claimed_batches
         with lock:
-            running += 1
-        try:
-            return run_case_batch(exe_path, batch, job)
-        finally:
+            remaining = total - next_index
+            if remaining <= 0:
+                return []
+
+            # 关键规则：总是按“剩余/并发”估算下一批大小，并受 group_size 上限约束。
+            # 当剩余用例减少时，batch_size 会自然变小（最小 1）。
+            base_group_size = min(group_size, max(1, math.ceil(remaining / max(1, workers))))
+
+            # 平滑收缩：进入 shrink 区间后，允许的批大小从 group_size 线性下降到 1。
+            # 同时叠加 base_group_size，兼顾并发利用率与尾部细粒度收尾。
+            if remaining <= smooth_shrink_start_remaining:
+                shrink_span = max(1, smooth_shrink_start_remaining - 1)
+                shrink_progress = (smooth_shrink_start_remaining - remaining) / shrink_span
+                smooth_cap = max(1, math.ceil(group_size - (group_size - 1) * shrink_progress))
+                dynamic_group_size = min(base_group_size, smooth_cap)
+            else:
+                dynamic_group_size = base_group_size
+
+            # 保证最后一轮是 1 个测例/批。
+            if remaining <= max(1, workers):
+                dynamic_group_size = 1
+
+            end = min(total, next_index + dynamic_group_size)
+            batch = ordered_cases[next_index:end]
+            next_index = end
+            claimed_batches += 1
+            return batch
+
+    def worker_loop() -> None:
+        nonlocal running, done, passed_count, failed_count, skipped_count
+
+        while True:
+            batch = claim_next_batch()
+            if not batch:
+                return
+
             with lock:
-                running -= 1
+                running += 1
+            try:
+                batch_result = run_case_batch(exe_path, batch, job)
+            finally:
+                with lock:
+                    running -= 1
+
+            with lock:
+                done += len(batch_result)
+                for case_name, status in batch_result.items():
+                    if status == "PASS":
+                        passed_count += 1
+                    elif status == "SKIPPED":
+                        skipped_count += 1
+                    else:
+                        failed_count += 1
+                    results[case_name] = status
 
     def progress_loop() -> None:
         previous_len = 0
@@ -297,19 +434,9 @@ def run_cases_parallel(
     executor = ThreadPoolExecutor(max_workers=workers)
     shutdown_wait = True
     try:
-        future_map = {executor.submit(task, batch): batch for batch in grouped_cases}
-        for future in as_completed(future_map):
-            batch_result = future.result()
-            with lock:
-                done += len(batch_result)
-                for case_name, status in batch_result.items():
-                    if status == "PASS":
-                        passed_count += 1
-                    elif status == "SKIPPED":
-                        skipped_count += 1
-                    else:
-                        failed_count += 1
-                    results[case_name] = status
+        futures = [executor.submit(worker_loop) for _ in range(workers)]
+        for future in as_completed(futures):
+            future.result()
     except KeyboardInterrupt:
         shutdown_wait = False
         executor.shutdown(wait=False, cancel_futures=True)
@@ -327,6 +454,8 @@ def run_cases_parallel(
                 f"[{label}] done {total}/{total} pass={passed_count} fail={failed_count} "
                 f"skip={skipped_count} t={format_elapsed(start_time)}"
             )
+
+    print(f"[{label}] dynamic batches claimed: {claimed_batches}")
 
     return results
 
@@ -441,6 +570,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.workers <= 0:
         raise ValueError("workers 必须 > 0")
+    if args.group_size <= 0:
+        raise ValueError("group-size 必须 > 0")
+    if args.group_multiplier <= 0:
+        raise ValueError("group-multiplier 必须 > 0")
 
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -477,9 +610,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with JobObject() as job:
             if args.run_mode in {"both", "debug"}:
-                debug_updates = run_cases_parallel(debug_exe, target_cases, args.workers, args.group_size, "debug", show_progress, job)
+                debug_updates = run_cases_parallel(
+                    debug_exe,
+                    target_cases,
+                    args.workers,
+                    args.group_size,
+                    args.group_multiplier,
+                    "debug",
+                    show_progress,
+                    job,
+                )
             if args.run_mode in {"both", "release"}:
-                release_updates = run_cases_parallel(release_exe, target_cases, args.workers, args.group_size, "release", show_progress, job)
+                release_updates = run_cases_parallel(
+                    release_exe,
+                    target_cases,
+                    args.workers,
+                    args.group_size,
+                    args.group_multiplier,
+                    "release",
+                    show_progress,
+                    job,
+                )
     except KeyboardInterrupt:
         interrupted = True
         print("[CLEANUP] Terminating all child processes...")

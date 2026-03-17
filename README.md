@@ -5,7 +5,7 @@
 ## 主要文件
 
 - `run_tests.py`：按 `mode.csv` 中的模式并行运行 debug/release，并可在结束后自动调用 `summary.py`。
-- `partial_tests.py`：按“批量分组”串行聚合后并行执行，支持 `full`/`partial` 增量重测模式。
+- `partial_tests.py`：按“批量分组”串行聚合后并行执行，支持崩溃隔离接力与自适应分组，支持 `full`/`partial` 增量重测模式。
 - `summary.py`：读取日志目录，生成 `summary.csv`、`list-skipped.csv`、`list-failed.csv`。
 - `mode.csv`：测试模式配置（`fileName`, `filterName`, `testNum`）。
 
@@ -60,8 +60,9 @@ python partial_tests.py --no-progress
 
 - `--mode {full,partial}`：全量或增量重测。
 - `--run-mode {both,debug,release}`：选择构建目标。
-- `--workers <int>`：并行线程数（默认 6）。
-- `--group-size <int>`：单个分组内的测例数量（默认 50）。提升能效的同时避免命令行过长，脚本遇到崩溃能够自动剔除死点接力下半场。
+- `--workers <int>`：并行线程数（默认 30）。
+- `--group-size <int>`：单个分组的最大测例数（默认 100）。
+- `--group-multiplier <int>`：批次数倍率（默认 8），目标批次数约为 `workers * group-multiplier`，用于降低尾部拖尾。
 - `--debug-exe <path>` / `--release-exe <path>`：覆盖可执行文件路径。
 - `--output-dir <dir>`：输出目录（当前默认 `output-partial`）。
 - `--result-csv <path>` / `--list-log <path>`：覆盖结果文件路径。
