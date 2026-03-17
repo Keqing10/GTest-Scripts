@@ -15,6 +15,7 @@ from utils.path_utils import resolve_path_from
 from utils.path_utils import resolve_under_output
 from utils.gtest_parser import infer_single_case_status
 from utils.gtest_parser import parse_gtest_list_output
+from utils.gtest_parser import parse_batch_case_statuses
 from utils.progress import render_progress_bar
 from utils.progress import SPINNER_FRAMES
 from utils.process_job import JobObject
@@ -46,8 +47,11 @@ DEFAULT_LIST_LOG = "list.log"
 DEFAULT_LIST_SKIPPED_CSV = "list-skipped.csv"
 # DEFAULT_LIST_FAILED_CSV: 默认失败用例清单文件名（和 run_tests 风格一致）。
 DEFAULT_LIST_FAILED_CSV = "list-failed.csv"
-# DEFAULT_WORKERS: 默认并行线程数（每个线程一次只跑一个测例）。
+# DEFAULT_WORKERS: 默认并行线程数（每个线程一次跑一批测例）。
 DEFAULT_WORKERS = 6
+# DEFAULT_TESTS_PER_GROUP: 每批次执行的测例数目。
+# 组装数量太大可能触发命令行长度限制 (8191)。50左右较安全，能有效降低启动开销。
+DEFAULT_TESTS_PER_GROUP = 50
 # DEFAULT_TEST_MODE: 默认测试范围。full=全量；partial=只重测未双通过用例。
 DEFAULT_TEST_MODE = "full"  # full | partial
 # DEFAULT_RUN_MODE: 默认构建模式。both/debug/release。
@@ -94,6 +98,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--result-csv", default=DEFAULT_RESULT_CSV, help="结果 CSV 文件名或路径。")
     parser.add_argument("--list-log", default=DEFAULT_LIST_LOG, help="测例清单文件名或路径。")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="并行线程数。")
+    parser.add_argument("--group-size", type=int, default=DEFAULT_TESTS_PER_GROUP, help="每个执行实例串行跑的最大用例数。")
     parser.add_argument("--no-progress", action="store_true", help="关闭终端进度条，改为仅输出关键日志。")
     return parser.parse_args(argv)
 
@@ -127,27 +132,66 @@ def write_case_list_log(list_log: Path, cases: list[str]) -> None:
             handle.write("\n")
 
 
-def run_one_case(exe_path: Path, case_name: str, job: JobObject) -> str:
-    # 每个子进程只跑 1 个用例，满足“单测粒度并行”。
-    process = subprocess.Popen(
-        [str(exe_path), f"--gtest_filter={case_name}"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=str(SCRIPT_DIR),
-    )
-    job.add_process(process._handle)
-    stdout_text, stderr_text = process.communicate()
+def run_case_batch(exe_path: Path, cases: list[str], job: JobObject) -> dict[str, str]:
+    # 按照批次顺次执行：如果遇到由于异常进程崩溃导致中断，记录崩溃用例为 FAIL，并重新拉起剩余未执行的用例。
+    results: dict[str, str] = {}
+    remaining = cases[:]
 
-    # 单用例模式下优先以状态行判定，避免把 SKIPPED 误归类为 PASS。
-    output_text = (stdout_text or "") + "\n" + (stderr_text or "")
-    status = infer_single_case_status(output_text)
-    if status != "UNKNOWN":
-        return status
+    while remaining:
+        filter_arg = ":".join(remaining)
+        process = subprocess.Popen(
+            [str(exe_path), f"--gtest_filter={filter_arg}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(SCRIPT_DIR),
+        )
+        job.add_process(process._handle)
+        stdout_text, stderr_text = process.communicate()
 
-    return "PASS" if process.returncode == 0 else "FAIL"
+        output_text = (stdout_text or "") + "\n" + (stderr_text or "")
+        started, finished = parse_batch_case_statuses(output_text)
+
+        crashed_index = -1
+        for i, c in enumerate(remaining):
+            if c in finished:
+                results[c] = finished[c]
+            elif c in started:
+                # 运行了一半没有完成，说明它是直接导致崩溃的元凶
+                results[c] = "FAIL"
+                crashed_index = i
+                break
+            else:
+                # 既没运行完也没开始运行
+                if "DISABLED_" in c:
+                    # gtest 会自动跳过带有 DISABLED_ 前缀的测试，不输出 RUN 和完成状态，这是正常的
+                    results[c] = "SKIPPED"
+                else:
+                    # 正常用例却没有被打出运行标志 -> 进程在到达它之前就崩溃了（比如上一个用例的 TearDown，或是进程起不来）
+                    crashed_index = i
+                    break
+
+        if crashed_index == 0 and not started:
+            # 情况A：程序在跑到第一个正常的用例（非DISABLED）之前就崩溃了。
+            # 这可能是该用例的 SetUp 崩溃，或者是全局起不来。
+            # 为了防止对着同一个用例疯狂重启导致死循环，把它吃掉并仅仅将其标记为FAIL。从而让后面的用例有机会继续。
+            results[remaining[0]] = "FAIL"
+            remaining = remaining[1:]
+        elif crashed_index >= 0:
+            # 发生了部分崩溃，尝试从崩溃位置继续接力
+            if remaining[crashed_index] in started:
+                # 这个用例运行一半挂了，下一批不再跑它，从它的下一个用例开始
+                remaining = remaining[crashed_index + 1:]
+            else:
+                # 这个用例还没碰到就挂了，下一批从它自己开始重新跑
+                remaining = remaining[crashed_index:]
+        else:
+            # 正常遍历结束，全部处理完成
+            remaining = []
+
+    return results
 
 
 def format_elapsed(start_time: float) -> str:
@@ -172,13 +216,17 @@ def run_cases_parallel(
     exe_path: Path,
     cases: list[str],
     workers: int,
+    group_size: int,
     label: str,
     show_progress: bool,
     job: JobObject,
 ) -> dict[str, str]:
-    """并行执行用例，返回 {case_name: PASS/FAIL/SKIPPED}。"""
+    """并行执行用例（基于分组串行执行），返回 {case_name: PASS/FAIL/SKIPPED}。"""
     if not cases:
         return {}
+    
+    # 按照先后顺序分组，保留 Suite 内局部性，能重用 GTest 的 Suite-level Setup/Teardown 开销
+    grouped_cases = [cases[i:i + group_size] for i in range(0, len(cases), group_size)]
 
     total = len(cases)
     results: dict[str, str] = {}
@@ -194,12 +242,12 @@ def run_cases_parallel(
     stop_event = threading.Event()
     start_time = time.time()
 
-    def task(case_name: str) -> tuple[str, str]:
+    def task(batch: list[str]) -> dict[str, str]:
         nonlocal running
         with lock:
             running += 1
         try:
-            return case_name, run_one_case(exe_path, case_name, job)
+            return run_case_batch(exe_path, batch, job)
         finally:
             with lock:
                 running -= 1
@@ -249,18 +297,19 @@ def run_cases_parallel(
     executor = ThreadPoolExecutor(max_workers=workers)
     shutdown_wait = True
     try:
-        future_map = {executor.submit(task, case_name): case_name for case_name in cases}
+        future_map = {executor.submit(task, batch): batch for batch in grouped_cases}
         for future in as_completed(future_map):
-            case_name, status = future.result()
+            batch_result = future.result()
             with lock:
-                done += 1
-                if status == "PASS":
-                    passed_count += 1
-                elif status == "SKIPPED":
-                    skipped_count += 1
-                else:
-                    failed_count += 1
-            results[case_name] = status
+                done += len(batch_result)
+                for case_name, status in batch_result.items():
+                    if status == "PASS":
+                        passed_count += 1
+                    elif status == "SKIPPED":
+                        skipped_count += 1
+                    else:
+                        failed_count += 1
+                    results[case_name] = status
     except KeyboardInterrupt:
         shutdown_wait = False
         executor.shutdown(wait=False, cancel_futures=True)
@@ -428,9 +477,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with JobObject() as job:
             if args.run_mode in {"both", "debug"}:
-                debug_updates = run_cases_parallel(debug_exe, target_cases, args.workers, "debug", show_progress, job)
+                debug_updates = run_cases_parallel(debug_exe, target_cases, args.workers, args.group_size, "debug", show_progress, job)
             if args.run_mode in {"both", "release"}:
-                release_updates = run_cases_parallel(release_exe, target_cases, args.workers, "release", show_progress, job)
+                release_updates = run_cases_parallel(release_exe, target_cases, args.workers, args.group_size, "release", show_progress, job)
     except KeyboardInterrupt:
         interrupted = True
         print("[CLEANUP] Terminating all child processes...")

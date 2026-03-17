@@ -18,6 +18,12 @@ COMPLETE_CASE_LINE_RE = re.compile(r"^\[\s*(OK|FAILED|SKIPPED)\s*\]")
 # 执行日志中带耗时的 FAILED/SKIPPED 用例行。
 NAMED_CASE_STATUS_RE = re.compile(r"^\[\s+(FAILED|SKIPPED)\s+\]\s+(.+?)\s+\((\d+)\s+ms\)\s*$")
 
+# 单单个 case 启动标志
+RUN_CASE_RE = re.compile(r"^\[\s*RUN\s*\]\s+(.+?)\s*$")
+
+# 提取每一行明确的结果（包括 PASSED/OK, FAILED, SKIPPED）及测例名
+COMPLETE_CASE_RESULT_RE = re.compile(r"^\[\s*(OK|PASSED|FAILED|SKIPPED)\s*\]\s+(.+?)(?:\s+\(\d+\s+ms\))?\s*$")
+
 # 汇总段解析规则。
 SUMMARY_MARKER = "[----------] Global test environment tear-down"
 SUMMARY_TOTAL_RE = re.compile(r"\[==========\]\s+(\d+)\s+tests?\s+from\s+.*ran\.\s+\((\d+)\s+ms\s+total\)")
@@ -84,6 +90,31 @@ def is_complete_case_line(line: str) -> bool:
     """判断一行输出是否表示 gtest 单个 case 已完成。"""
 
     return bool(COMPLETE_CASE_LINE_RE.match(line))
+
+
+def parse_batch_case_statuses(log_text: str) -> tuple[set[str], dict[str, str]]:
+    """批量从一次执行的完整输出中解析各个用例的结果。返回 (已开始的用例集合, 已完成的用例及其结果字典)。"""
+    
+    started_cases = set()
+    parsed_results = {}
+    for line in log_text.splitlines():
+        run_match = RUN_CASE_RE.match(line)
+        if run_match:
+            started_cases.add(run_match.group(1).strip())
+            continue
+
+        match = COMPLETE_CASE_RESULT_RE.match(line)
+        if match:
+            status, case_name = match.groups()
+            case_name = case_name.strip()
+            if status in ("OK", "PASSED"):
+                parsed_results[case_name] = "PASS"
+            elif status == "FAILED":
+                parsed_results[case_name] = "FAIL"
+            elif status == "SKIPPED":
+                parsed_results[case_name] = "SKIPPED"
+    
+    return started_cases, parsed_results
 
 
 def extract_named_cases_by_status(log_text: str, status_name: str) -> set[str]:
