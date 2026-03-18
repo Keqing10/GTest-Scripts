@@ -10,8 +10,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from utils.case_report import write_case_presence_csv
+from utils.csv_utils import write_csv_rows
 from utils.path_utils import resolve_path_from
 from utils.path_utils import resolve_under_output
 from utils.gtest_parser import parse_gtest_list_output
@@ -47,6 +49,8 @@ DEFAULT_LIST_LOG = "list.log"
 DEFAULT_LIST_SKIPPED_CSV = "list-skipped.csv"
 # DEFAULT_LIST_FAILED_CSV: 默认失败用例清单文件名（和 run_tests 风格一致）。
 DEFAULT_LIST_FAILED_CSV = "list-failed.csv"
+# DEFAULT_SUMMARY_CSV: 默认执行总结文件名。
+DEFAULT_SUMMARY_CSV = "summary.csv"
 # DEFAULT_WORKERS: 默认并行线程数（每个线程一次跑一批测例）。
 DEFAULT_WORKERS = 30
 # DEFAULT_TESTS_PER_GROUP: 每批次执行的测例数目。
@@ -54,8 +58,6 @@ DEFAULT_WORKERS = 30
 DEFAULT_TESTS_PER_GROUP = 50
 # DEFAULT_GROUP_MULTIPLIER: 批次数倍率。目标批次数约为 workers * 倍率（同时受 group-size 上限约束）。
 DEFAULT_GROUP_MULTIPLIER = 8
-# DEFAULT_BATCH_START_RETRIES: 批次在首用例前崩溃时的重试次数，避免瞬时资源抖动被误判为 FAIL。
-DEFAULT_BATCH_START_RETRIES = 2
 # DEFAULT_TEST_MODE: 默认测试范围。full=全量；partial=只重测未双通过用例。
 DEFAULT_TEST_MODE = "full"  # full | partial
 # DEFAULT_RUN_MODE: 默认构建模式。both/debug/release。
@@ -66,9 +68,8 @@ DEFAULT_ENABLE_PROGRESS = True
 DEFAULT_PROGRESS_REFRESH_SEC = 1
 # DEFAULT_PROGRESS_BAR_WIDTH: 进度条宽度。
 DEFAULT_PROGRESS_BAR_WIDTH = 20
-# DEFAULT_SMOOTH_SHRINK_START_RATIO: 从总量的该比例处开始平滑缩组（0~1）。
-# 例如 0.60 表示前 40% 保持吞吐，后 60% 线性收敛到 1。
-DEFAULT_SMOOTH_SHRINK_START_RATIO = 0.60
+# DEFAULT_CASE_TIMEOUT_SEC: 单测例超时时间（秒），超时后标记 FAIL。
+DEFAULT_CASE_TIMEOUT_SEC = 300.0
 
 # DEFAULT_DEBUG_EXE: Debug 版 tests.exe 默认路径。支持绝对路径或相对路径。
 DEFAULT_DEBUG_EXE = Path(r"Debug/tests.exe")
@@ -104,9 +105,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="输出目录（含 list.log 和结果 CSV）。")
     parser.add_argument("--result-csv", default=DEFAULT_RESULT_CSV, help="结果 CSV 文件名或路径。")
     parser.add_argument("--list-log", default=DEFAULT_LIST_LOG, help="测例清单文件名或路径。")
+    parser.add_argument("--summary-csv", default=DEFAULT_SUMMARY_CSV, help="执行总结 CSV 文件名或路径。")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="并行线程数。")
     parser.add_argument("--group-size", type=int, default=DEFAULT_TESTS_PER_GROUP, help="每个执行实例串行跑的最大用例数。")
     parser.add_argument("--group-multiplier", type=int, default=DEFAULT_GROUP_MULTIPLIER, help="批次数倍率（目标批次数约为 workers*倍率）。")
+    parser.add_argument(
+        "--case-timeout-sec",
+        type=float,
+        default=DEFAULT_CASE_TIMEOUT_SEC,
+        help="单个测例超时时间（秒），默认 300 秒。",
+    )
     parser.add_argument("--no-progress", action="store_true", help="关闭终端进度条，改为仅输出关键日志。")
     return parser.parse_args(argv)
 
@@ -169,108 +177,56 @@ def interleave_cases_by_suite(cases: list[str]) -> list[str]:
     return interleaved
 
 
-def build_case_batches(
+def run_single_case_with_timeout(exe_path: Path, case_name: str, timeout_sec: float, job: JobObject) -> str:
+    if "DISABLED_" in case_name:
+        return "SKIPPED"
+
+    process = subprocess.Popen(
+        [str(exe_path), f"--gtest_filter={case_name}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(SCRIPT_DIR),
+    )
+    job.add_process(process._handle)
+
+    try:
+        stdout_text, stderr_text = process.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        print(f"[TIMEOUT] 单测例超时: {case_name} > {int(timeout_sec)}s，标记 FAIL")
+        return "FAIL"
+
+    output_text = (stdout_text or "") + "\n" + (stderr_text or "")
+    _started, finished, _parsed_elapsed = parse_batch_case_statuses(output_text)
+
+    if case_name in finished:
+        return finished[case_name]
+    if "DISABLED" in output_text.upper():
+        return "SKIPPED"
+    return "FAIL"
+
+
+def run_case_batch(
+    exe_path: Path,
     cases: list[str],
-    workers: int,
-    max_group_size: int,
-    group_multiplier: int,
-) -> tuple[list[list[str]], int, str]:
-    """构建自适应分组。
-
-    策略：
-    - `max_group_size` 仅作为上限；
-    - 批次数会适度多于 worker，增强后半程补位能力；
-    - 用 round-robin 分配，尽量打散潜在慢测例，缓解尾部拖尾。
-    """
-
-    if not cases:
-        return [], 0, "empty"
-
-    # 先按 suite 打散，再进入轮转分组，降低“慢 suite 尾部集中”概率。
-    ordered_cases = interleave_cases_by_suite(cases)
-
-    total = len(ordered_cases)
-    min_groups_for_cap = max(1, math.ceil(total / max_group_size))
-    # 保持比 worker 更多的批次，提升线程池后半程补位能力，减少尾部仅剩少量进程。
-    target_groups = max(min_groups_for_cap, min(total, max(1, workers) * max(1, group_multiplier)))
-
-    batches: list[list[str]] = [[] for _ in range(target_groups)]
-    for index, case_name in enumerate(ordered_cases):
-        batches[index % target_groups].append(case_name)
-
-    compact_batches = [b for b in batches if b]
-    adaptive_group_size = max(len(b) for b in compact_batches)
-    return compact_batches, adaptive_group_size, "count-adaptive-rr"
-
-
-def run_case_batch(exe_path: Path, cases: list[str], job: JobObject) -> dict[str, str]:
-    # 按照批次顺次执行：如果遇到由于异常进程崩溃导致中断，记录崩溃用例为 FAIL，并重新拉起剩余未执行的用例。
+    case_timeout_sec: float,
+    job: JobObject,
+    on_case_result: Callable[[str, str], None] | None = None,
+) -> dict[str, str]:
+    # 批次仅用于调度；批内逐条执行，确保“单测例超时判 FAIL”。
     results: dict[str, str] = {}
-    remaining = cases[:]
-    start_retry_counter: dict[str, int] = {}
-
-    while remaining:
-        filter_arg = ":".join(remaining)
-        process = subprocess.Popen(
-            [str(exe_path), f"--gtest_filter={filter_arg}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(SCRIPT_DIR),
-        )
-        job.add_process(process._handle)
-        stdout_text, stderr_text = process.communicate()
-
-        output_text = (stdout_text or "") + "\n" + (stderr_text or "")
-        started, finished, _parsed_elapsed = parse_batch_case_statuses(output_text)
-
-        crashed_index = -1
-        for i, c in enumerate(remaining):
-            if c in finished:
-                results[c] = finished[c]
-            elif c in started:
-                # 运行了一半没有完成，说明它是直接导致崩溃的元凶
-                results[c] = "FAIL"
-                crashed_index = i
-                break
-            else:
-                # 既没运行完也没开始运行
-                if "DISABLED_" in c:
-                    # gtest 会自动跳过带有 DISABLED_ 前缀的测试，不输出 RUN 和完成状态，这是正常的
-                    results[c] = "SKIPPED"
-                else:
-                    # 正常用例却没有被打出运行标志 -> 进程在到达它之前就崩溃了（比如上一个用例的 TearDown，或是进程起不来）
-                    crashed_index = i
-                    break
-
-        if crashed_index == 0 and not started:
-            # 情况A：程序在跑到第一个正常的用例（非DISABLED）之前就崩溃了。
-            # 这可能是该用例的 SetUp 崩溃，或者是全局起不来。
-            # 先短重试，避免瞬时资源抖动导致的误判 FAIL。
-            head_case = remaining[0]
-            retry_count = start_retry_counter.get(head_case, 0)
-            if retry_count < DEFAULT_BATCH_START_RETRIES:
-                start_retry_counter[head_case] = retry_count + 1
-                time.sleep(0.05 * (retry_count + 1))
-                continue
-
-            # 多次重试仍失败，再标记为 FAIL 并跳过，防止死循环。
-            results[head_case] = "FAIL"
-            remaining = remaining[1:]
-        elif crashed_index >= 0:
-            # 发生了部分崩溃，尝试从崩溃位置继续接力
-            if remaining[crashed_index] in started:
-                # 这个用例运行一半挂了，下一批不再跑它，从它的下一个用例开始
-                remaining = remaining[crashed_index + 1:]
-            else:
-                # 这个用例还没碰到就挂了，下一批从它自己开始重新跑
-                remaining = remaining[crashed_index:]
-        else:
-            # 正常遍历结束，全部处理完成
-            remaining = []
-
+    for case_name in cases:
+        status = run_single_case_with_timeout(exe_path, case_name, case_timeout_sec, job)
+        results[case_name] = status
+        if on_case_result is not None:
+            on_case_result(case_name, status)
     return results
 
 
@@ -298,6 +254,7 @@ def run_cases_parallel(
     workers: int,
     group_size: int,
     group_multiplier: int,
+    case_timeout_sec: float,
     label: str,
     show_progress: bool,
     job: JobObject,
@@ -319,11 +276,11 @@ def run_cases_parallel(
     running = 0
     next_index = 0
     claimed_batches = 0
-    smooth_shrink_start_remaining = max(1, math.ceil(total * DEFAULT_SMOOTH_SHRINK_START_RATIO))
+    target_batches_remaining = max(1, workers) * max(1, group_multiplier)
 
     print(
         f"[{label}] 分组策略: dynamic-claim workers={workers} group_mult={group_multiplier} max_group={group_size} "
-        f"smooth_shrink_start={smooth_shrink_start_remaining}/{total}"
+        f"target_batches={target_batches_remaining} timeout={int(case_timeout_sec)}s"
     )
 
     interactive = show_progress and sys.stdout.isatty()
@@ -338,19 +295,9 @@ def run_cases_parallel(
             if remaining <= 0:
                 return []
 
-            # 关键规则：总是按“剩余/并发”估算下一批大小，并受 group_size 上限约束。
-            # 当剩余用例减少时，batch_size 会自然变小（最小 1）。
-            base_group_size = min(group_size, max(1, math.ceil(remaining / max(1, workers))))
-
-            # 平滑收缩：进入 shrink 区间后，允许的批大小从 group_size 线性下降到 1。
-            # 同时叠加 base_group_size，兼顾并发利用率与尾部细粒度收尾。
-            if remaining <= smooth_shrink_start_remaining:
-                shrink_span = max(1, smooth_shrink_start_remaining - 1)
-                shrink_progress = (smooth_shrink_start_remaining - remaining) / shrink_span
-                smooth_cap = max(1, math.ceil(group_size - (group_size - 1) * shrink_progress))
-                dynamic_group_size = min(base_group_size, smooth_cap)
-            else:
-                dynamic_group_size = base_group_size
+            # 平滑收缩：保持大约 workers*group_multiplier 个待领批次。
+            # remaining 越少，batch_size 越小，最终自然降到 1。
+            dynamic_group_size = min(group_size, max(1, math.ceil(remaining / target_batches_remaining)))
 
             # 保证最后一轮是 1 个测例/批。
             if remaining <= max(1, workers):
@@ -370,17 +317,10 @@ def run_cases_parallel(
             if not batch:
                 return
 
-            with lock:
-                running += 1
-            try:
-                batch_result = run_case_batch(exe_path, batch, job)
-            finally:
+            def on_case_result(case_name: str, status: str) -> None:
+                nonlocal done, passed_count, failed_count, skipped_count
                 with lock:
-                    running -= 1
-
-            with lock:
-                done += len(batch_result)
-                for case_name, status in batch_result.items():
+                    done += 1
                     if status == "PASS":
                         passed_count += 1
                     elif status == "SKIPPED":
@@ -388,6 +328,20 @@ def run_cases_parallel(
                     else:
                         failed_count += 1
                     results[case_name] = status
+
+            with lock:
+                running += 1
+            try:
+                run_case_batch(
+                    exe_path,
+                    batch,
+                    case_timeout_sec,
+                    job,
+                    on_case_result=on_case_result,
+                )
+            finally:
+                with lock:
+                    running -= 1
 
     def progress_loop() -> None:
         previous_len = 0
@@ -529,11 +483,8 @@ def select_cases_for_partial(all_cases: list[str], existing: dict[str, CaseResul
 
 def write_result_csv(csv_path: Path, rows: list[CaseResult]) -> None:
     # 输出固定三列：case_name, debug_pass, release_pass。
-    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["case_name", "debug_pass", "release_pass"])
-        for row in rows:
-            writer.writerow([row.case_name, row.debug_pass, row.release_pass])
+    csv_rows = ([row.case_name, row.debug_pass, row.release_pass] for row in rows)
+    write_csv_rows(csv_path, ["case_name", "debug_pass", "release_pass"], csv_rows)
 
 
 def collect_case_flags(rows: list[CaseResult], status_name: str) -> dict[str, tuple[bool, bool]]:
@@ -544,6 +495,93 @@ def collect_case_flags(rows: list[CaseResult], status_name: str) -> dict[str, tu
         if debug_hit or release_hit:
             cases[row.case_name] = (debug_hit, release_hit)
     return cases
+
+
+def count_statuses(result_map: dict[str, str] | None) -> tuple[int, int, int]:
+    if not result_map:
+        return 0, 0, 0
+
+    pass_count = 0
+    fail_count = 0
+    skip_count = 0
+    for status in result_map.values():
+        if status == "PASS":
+            pass_count += 1
+        elif status == "SKIPPED":
+            skip_count += 1
+        else:
+            fail_count += 1
+    return pass_count, fail_count, skip_count
+
+
+def write_summary_csv(
+    summary_csv: Path,
+    mode: str,
+    run_mode: str,
+    total_cases: int,
+    target_cases: int,
+    workers: int,
+    group_size: int,
+    group_multiplier: int,
+    case_timeout_sec: float,
+    elapsed_sec: int,
+    debug_updates: dict[str, str] | None,
+    release_updates: dict[str, str] | None,
+) -> None:
+    generated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    header = [
+        "generated_at",
+        "mode",
+        "run_mode",
+        "stage",
+        "total_cases",
+        "target_cases",
+        "executed_cases",
+        "pass_count",
+        "fail_count",
+        "skip_count",
+        "pass_rate",
+        "elapsed_sec",
+        "workers",
+        "group_size",
+        "group_multiplier",
+        "case_timeout_sec",
+    ]
+
+    csv_rows: list[list[object]] = []
+
+    def append_row(stage: str, updates: dict[str, str] | None) -> None:
+        pass_count, fail_count, skip_count = count_statuses(updates)
+        executed_cases = len(updates) if updates else 0
+        pass_rate = (pass_count / executed_cases * 100.0) if executed_cases > 0 else 0.0
+        csv_rows.append(
+            [
+                generated_at,
+                mode,
+                run_mode,
+                stage,
+                total_cases,
+                target_cases,
+                executed_cases,
+                pass_count,
+                fail_count,
+                skip_count,
+                f"{pass_rate:.2f}%",
+                elapsed_sec,
+                workers,
+                group_size,
+                group_multiplier,
+                f"{case_timeout_sec:.1f}",
+            ]
+        )
+
+    if debug_updates is not None:
+        append_row("debug", debug_updates)
+    if release_updates is not None:
+        append_row("release", release_updates)
+
+    write_csv_rows(summary_csv, header, csv_rows)
 
 
 # ===== 运行前检查与主流程 =====
@@ -574,11 +612,16 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("group-size 必须 > 0")
     if args.group_multiplier <= 0:
         raise ValueError("group-multiplier 必须 > 0")
+    if args.case_timeout_sec <= 0:
+        raise ValueError("case-timeout-sec 必须 > 0")
+
+    run_start_time = time.time()
 
     output_dir = resolve_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     result_csv = resolve_under_output(args.result_csv, output_dir)
+    summary_csv = resolve_under_output(args.summary_csv, output_dir)
     list_log = resolve_under_output(args.list_log, output_dir)
     list_skipped_csv = resolve_under_output(DEFAULT_LIST_SKIPPED_CSV, output_dir)
     list_failed_csv = resolve_under_output(DEFAULT_LIST_FAILED_CSV, output_dir)
@@ -616,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.workers,
                     args.group_size,
                     args.group_multiplier,
+                    args.case_timeout_sec,
                     "debug",
                     show_progress,
                     job,
@@ -627,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.workers,
                     args.group_size,
                     args.group_multiplier,
+                    args.case_timeout_sec,
                     "release",
                     show_progress,
                     job,
@@ -644,9 +689,25 @@ def main(argv: list[str] | None = None) -> int:
     failed_cases = collect_case_flags(merged_rows, "FAIL")
     write_case_presence_csv(list_skipped_csv, skipped_cases)
     write_case_presence_csv(list_failed_csv, failed_cases)
+    elapsed_sec = max(0, int(time.time() - run_start_time))
+    write_summary_csv(
+        summary_csv,
+        mode=args.mode,
+        run_mode=args.run_mode,
+        total_cases=len(all_cases),
+        target_cases=len(target_cases),
+        workers=args.workers,
+        group_size=args.group_size,
+        group_multiplier=args.group_multiplier,
+        case_timeout_sec=args.case_timeout_sec,
+        elapsed_sec=elapsed_sec,
+        debug_updates=debug_updates,
+        release_updates=release_updates,
+    )
     print(f"[INFO] 已更新结果 CSV: {result_csv}")
     print(f"[INFO] 已输出跳过清单: {list_skipped_csv}")
     print(f"[INFO] 已输出失败清单: {list_failed_csv}")
+    print(f"[INFO] 已输出执行汇总: {summary_csv}")
     return 0
 
 

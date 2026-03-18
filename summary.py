@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from utils.case_report import write_case_presence_csv
+from utils.csv_utils import write_csv_dict_rows
 from utils.gtest_parser import extract_named_cases_by_status
 from utils.gtest_parser import parse_summary_from_log_text
 
@@ -260,32 +261,28 @@ def write_csv(rows: list[SummaryRow], output_dir: Path) -> Path:
     """导出 summary.csv，方便后续比对或二次处理。"""
 
     csv_path = output_dir / "summary.csv"
+    fieldnames = [
+        "Test",
+        "DebugTotal",
+        "DebugPassed",
+        "DebugFailed",
+        "DebugSkipped",
+        "ReleaseTotal",
+        "ReleasePassed",
+        "ReleaseFailed",
+        "ReleaseSkipped",
+        "DebugRate",
+        "ReleaseRate",
+        "Debug(min)",
+        "Release(min)",
+        "Debug(ms)",
+        "Release(ms)",
+        "CountStatus",
+    ]
+    row_dicts = (row.to_csv_dict() for row in rows)
+
     try:
-        with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(
-                handle,
-                fieldnames=[
-                    "Test",
-                    "DebugTotal",
-                    "DebugPassed",
-                    "DebugFailed",
-                    "DebugSkipped",
-                    "ReleaseTotal",
-                    "ReleasePassed",
-                    "ReleaseFailed",
-                    "ReleaseSkipped",
-                    "DebugRate",
-                    "ReleaseRate",
-                    "Debug(min)",
-                    "Release(min)",
-                    "Debug(ms)",
-                    "Release(ms)",
-                    "CountStatus",
-                ],
-            )
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(row.to_csv_dict())
+        write_csv_dict_rows(csv_path, fieldnames, row_dicts)
     except PermissionError:
         print(f"[WARN] could not write {csv_path}: permission denied (maybe file open)", file=sys.stderr)
     return csv_path
