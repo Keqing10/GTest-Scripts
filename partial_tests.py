@@ -51,6 +51,8 @@ DEFAULT_LIST_SKIPPED_CSV = "list-skipped.csv"
 DEFAULT_LIST_FAILED_CSV = "list-failed.csv"
 # DEFAULT_SUMMARY_CSV: 默认执行总结文件名。
 DEFAULT_SUMMARY_CSV = "summary.csv"
+# DEFAULT_SUMMARY_PARTIAL_CSV: partial 模式附加明细汇总（记录 target_cases 等本次执行信息）。
+DEFAULT_SUMMARY_PARTIAL_CSV = "summary-partial.csv"
 # DEFAULT_WORKERS: 默认并行线程数（每个线程一次跑一批测例）。
 DEFAULT_WORKERS = 30
 # DEFAULT_TESTS_PER_GROUP: 每批次执行的测例数目。
@@ -59,7 +61,7 @@ DEFAULT_TESTS_PER_GROUP = 50
 # DEFAULT_GROUP_MULTIPLIER: 批次数倍率。目标批次数约为 workers * 倍率（同时受 group-size 上限约束）。
 DEFAULT_GROUP_MULTIPLIER = 8
 # DEFAULT_TEST_MODE: 默认测试范围。full=全量；partial=只重测未双通过用例。
-DEFAULT_TEST_MODE = "full"  # full | partial
+DEFAULT_TEST_MODE = "partial"  # full | partial
 # DEFAULT_RUN_MODE: 默认构建模式。both/debug/release。
 DEFAULT_RUN_MODE = "both"  # both | debug | release
 # DEFAULT_ENABLE_PROGRESS: 是否默认启用终端进度条。
@@ -497,7 +499,22 @@ def collect_case_flags(rows: list[CaseResult], status_name: str) -> dict[str, tu
     return cases
 
 
-def count_statuses(result_map: dict[str, str] | None) -> tuple[int, int, int]:
+def count_stage_statuses(rows: list[CaseResult], stage: str) -> tuple[int, int, int]:
+    pass_count = 0
+    fail_count = 0
+    skip_count = 0
+    for row in rows:
+        status = row.debug_pass if stage == "debug" else row.release_pass
+        if status == "PASS":
+            pass_count += 1
+        elif status == "FAIL":
+            fail_count += 1
+        elif status == "SKIPPED":
+            skip_count += 1
+    return pass_count, fail_count, skip_count
+
+
+def count_statuses_from_updates(result_map: dict[str, str] | None) -> tuple[int, int, int]:
     if not result_map:
         return 0, 0, 0
 
@@ -517,7 +534,57 @@ def count_statuses(result_map: dict[str, str] | None) -> tuple[int, int, int]:
 def write_summary_csv(
     summary_csv: Path,
     mode: str,
-    run_mode: str,
+    requested_run_mode: str,
+    total_cases: int,
+    elapsed_sec: int,
+    merged_rows: list[CaseResult],
+) -> None:
+    generated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+    header = [
+        "generated_at",
+        "mode",
+        "run_mode",
+        "total_cases",
+        "pass_count",
+        "fail_count",
+        "skip_count",
+        "pass_rate",
+        "elapsed_sec",
+    ]
+
+    csv_rows: list[list[object]] = []
+
+    stages: list[str]
+    if requested_run_mode == "both":
+        stages = ["debug", "release"]
+    else:
+        stages = [requested_run_mode]
+
+    for stage in stages:
+        pass_count, fail_count, skip_count = count_stage_statuses(merged_rows, stage)
+        pass_rate = (pass_count / total_cases * 100.0) if total_cases > 0 else 0.0
+        csv_rows.append(
+            [
+                generated_at,
+                mode,
+                stage,
+                total_cases,
+                pass_count,
+                fail_count,
+                skip_count,
+                f"{pass_rate:.2f}%",
+                elapsed_sec,
+            ]
+        )
+
+    write_csv_rows(summary_csv, header, csv_rows)
+
+
+def write_partial_summary_csv(
+    summary_partial_csv: Path,
+    mode: str,
+    requested_run_mode: str,
     total_cases: int,
     target_cases: int,
     workers: int,
@@ -534,7 +601,6 @@ def write_summary_csv(
         "generated_at",
         "mode",
         "run_mode",
-        "stage",
         "total_cases",
         "target_cases",
         "executed_cases",
@@ -549,17 +615,21 @@ def write_summary_csv(
         "case_timeout_sec",
     ]
 
-    csv_rows: list[list[object]] = []
+    rows: list[list[object]] = []
+    stages = ["debug", "release"] if requested_run_mode == "both" else [requested_run_mode]
 
-    def append_row(stage: str, updates: dict[str, str] | None) -> None:
-        pass_count, fail_count, skip_count = count_statuses(updates)
+    def updates_for_stage(stage: str) -> dict[str, str] | None:
+        return debug_updates if stage == "debug" else release_updates
+
+    for stage in stages:
+        updates = updates_for_stage(stage)
+        pass_count, fail_count, skip_count = count_statuses_from_updates(updates)
         executed_cases = len(updates) if updates else 0
         pass_rate = (pass_count / executed_cases * 100.0) if executed_cases > 0 else 0.0
-        csv_rows.append(
+        rows.append(
             [
                 generated_at,
                 mode,
-                run_mode,
                 stage,
                 total_cases,
                 target_cases,
@@ -576,12 +646,7 @@ def write_summary_csv(
             ]
         )
 
-    if debug_updates is not None:
-        append_row("debug", debug_updates)
-    if release_updates is not None:
-        append_row("release", release_updates)
-
-    write_csv_rows(summary_csv, header, csv_rows)
+    write_csv_rows(summary_partial_csv, header, rows)
 
 
 # ===== 运行前检查与主流程 =====
@@ -622,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result_csv = resolve_under_output(args.result_csv, output_dir)
     summary_csv = resolve_under_output(args.summary_csv, output_dir)
+    summary_partial_csv = resolve_under_output(DEFAULT_SUMMARY_PARTIAL_CSV, output_dir)
     list_log = resolve_under_output(args.list_log, output_dir)
     list_skipped_csv = resolve_under_output(DEFAULT_LIST_SKIPPED_CSV, output_dir)
     list_failed_csv = resolve_under_output(DEFAULT_LIST_FAILED_CSV, output_dir)
@@ -693,21 +759,32 @@ def main(argv: list[str] | None = None) -> int:
     write_summary_csv(
         summary_csv,
         mode=args.mode,
-        run_mode=args.run_mode,
+        requested_run_mode=args.run_mode,
         total_cases=len(all_cases),
-        target_cases=len(target_cases),
-        workers=args.workers,
-        group_size=args.group_size,
-        group_multiplier=args.group_multiplier,
-        case_timeout_sec=args.case_timeout_sec,
         elapsed_sec=elapsed_sec,
-        debug_updates=debug_updates,
-        release_updates=release_updates,
+        merged_rows=merged_rows,
     )
+    if args.mode == "partial":
+        write_partial_summary_csv(
+            summary_partial_csv,
+            mode=args.mode,
+            requested_run_mode=args.run_mode,
+            total_cases=len(all_cases),
+            target_cases=len(target_cases),
+            workers=args.workers,
+            group_size=args.group_size,
+            group_multiplier=args.group_multiplier,
+            case_timeout_sec=args.case_timeout_sec,
+            elapsed_sec=elapsed_sec,
+            debug_updates=debug_updates,
+            release_updates=release_updates,
+        )
     print(f"[INFO] 已更新结果 CSV: {result_csv}")
     print(f"[INFO] 已输出跳过清单: {list_skipped_csv}")
     print(f"[INFO] 已输出失败清单: {list_failed_csv}")
     print(f"[INFO] 已输出执行汇总: {summary_csv}")
+    if args.mode == "partial":
+        print(f"[INFO] 已输出 partial 执行汇总: {summary_partial_csv}")
     return 0
 
 
